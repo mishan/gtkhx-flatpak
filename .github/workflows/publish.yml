@@ -1,0 +1,444 @@
+# Publish a GtkHx release to the Flatpak repository at https://dl.gtkhx.org.
+#
+# mishan/gtkhx's flatpak-dispatch.yml starts this when a release is
+# published; it can also be run by hand from the Actions tab. Each run:
+#
+#   1. mirrors the live repository, which is the only copy of it: nothing
+#      here is ever committed, and each deploy replaces the whole site;
+#   2. imports the release's .flatpak bundles, one per architecture;
+#   3. commits them, signed, onto the channel's branch, and onto beta as
+#      well when a stable release passes it;
+#   4. regenerates the summary, the AppStream data and the static deltas,
+#      and prunes all but the last two commits behind each branch;
+#   5. writes the site files and updates.json, and deploys.
+#
+# The templates, the public key and the feed generator come from mishan/gtkhx
+# at main, so there is one copy of each. The generator runs in a job of its
+# own: no code from outside this repository runs in the job holding the key.
+#
+# The signing key never sits in a job that compiles code, and the bundles are
+# the release's own public assets, so the token that starts this run can't
+# put anything into the repository that isn't already released.
+#
+# Bootstrap: the first run has no live repository to mirror. Tick
+# `bootstrap` to start an empty one; it refuses if the site is already up,
+# so it can't wipe a live repository, and the dispatch from mishan/gtkhx never
+# sets it: a dispatched run against a missing site fails at once and says so.
+# `source: rebuild` builds the tag from source instead of taking its release
+# bundles, for recovery when those are missing or unusable. Rebuilding uses the
+# tag's own manifest with separate-locales forced off.
+
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in mishan/gtkhx, e.g. v1.4.1'
+        type: string
+        required: true
+      channel:
+        description: 'Channel to publish to'
+        type: choice
+        options: [stable, beta]
+        required: true
+      source:
+        description: "Where the bundles come from: the release's assets, or a rebuild of the tag"
+        type: choice
+        options: [release, rebuild]
+        default: release
+      bootstrap:
+        description: 'Start a new repository (refused if dl.gtkhx.org is already up)'
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  # Every run reads the live site, changes it and redeploys it whole, so two
+  # at once would each drop the other's change. Never cancel one halfway.
+  # GitHub keeps one pending run per group: a third dispatch while one runs
+  # cancels the second, which then has to be run again by hand.
+  group: pages
+  cancel-in-progress: false
+
+env:
+  APP: com.nasledov.gtkhx
+  SITE: https://dl.gtkhx.org
+
+jobs:
+  check:
+    name: check inputs
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        env:
+          TAG: ${{ inputs.tag }}
+          CHANNEL: ${{ inputs.channel }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+        run: |
+          # Before anything is built: with no site to mirror, a run can only
+          # start a new one, and only by hand.
+          if [ "$BOOTSTRAP" != true ]; then
+            status=$(curl -s -o /dev/null -w '%{http_code}' "$SITE/repo/config")
+            if [ "$status" = 404 ]; then
+              echo "::error::there is no repository at $SITE yet. To start" \
+                   "it, run this workflow again by hand with bootstrap=true."
+              exit 1
+            elif [ "$status" != 200 ]; then
+              echo "::error::$SITE/repo/config answered $status (000: unreachable)"
+              exit 1
+            fi
+          fi
+
+          tag=$(printf '%s' "$TAG" | tr -d '[:space:]')
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+((b|rc)[0-9]+)?$'; then
+            echo "::error::tag must look like v1.4.1, v1.4.1b1 or v1.4.1rc1 (got '$tag')"
+            exit 1
+          fi
+          # A pre-release on stable is a mislabeled release upstream.
+          if [ "$CHANNEL" = stable ] && ! printf '%s' "$tag" | grep -Eq '^v[0-9.]+$'; then
+            echo "::error::$tag is a pre-release; it can only go to beta"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  rebuild:
+    name: rebuild (${{ matrix.arch }})
+    needs: check
+    if: inputs.source == 'rebuild'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mishan/gtkhx
+          ref: ${{ needs.check.outputs.tag }}
+          persist-credentials: false
+
+      - name: install flatpak-builder
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+
+      - name: flathub remote + build deps
+        run: |
+          flatpak remote-add --user --if-not-exists flathub \
+            https://flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --user --install-deps-from=flathub --install-deps-only \
+            --force-clean build-flatpak "$APP.yml"
+
+      - name: keep translations in the app, and stamp the version
+        # A tag cut before separate-locales was set puts translations in a
+        # .Locale extension, which a bundle leaves behind. The version line
+        # only lands where the tag's manifest has the line it follows.
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          grep -q '^separate-locales:' "$APP.yml" ||
+            sed -i '/^command:/a separate-locales: false' "$APP.yml"
+          sed -i "s|^      - -Dupdate_check=enabled\$|&\n      - -Dbuild_version=${TAG#v}|" \
+            "$APP.yml"
+
+      - name: build flatpak bundle
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: tools/build-flatpak-bundle.sh -o "GtkHx-$TAG-${{ matrix.arch }}.flatpak"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gtkhx-flatpak-${{ matrix.arch }}
+          path: '*.flatpak'
+          if-no-files-found: error
+
+  feed:
+    name: update the feed
+    needs: check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      feed: ${{ steps.f.outputs.feed }}
+      channels: ${{ steps.f.outputs.channels }}
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      CHANNEL: ${{ inputs.channel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mishan/gtkhx
+          ref: main
+          path: gtkhx
+          persist-credentials: false
+          sparse-checkout: tools/update-feed.py
+          sparse-checkout-cone-mode: false
+
+      - id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+        run: |
+          feed=()
+          if [ "$BOOTSTRAP" != true ]; then
+            curl -fsS -o live-updates.json "$SITE/updates.json"
+            feed=(--feed live-updates.json)
+          fi
+          gh release view "$TAG" -R mishan/gtkhx \
+            --json tagName,publishedAt,url,assets > release.json
+          python3 gtkhx/tools/update-feed.py --channel "$CHANNEL" \
+            --release release.json "${feed[@]}" > updates.json
+          cat updates.json
+
+          # The feed decides whether beta follows stable; the repository
+          # does the same.
+          channels="$CHANNEL"
+          if [ "$CHANNEL" = stable ] &&
+             [ "$(jq -r .channels.beta.version updates.json)" = "${TAG#v}" ]; then
+            channels="stable beta"
+          fi
+          echo "channels=$channels" >> "$GITHUB_OUTPUT"
+          echo "feed=$(jq -c . updates.json)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: publish to ${{ inputs.channel }}
+    needs: [check, rebuild, feed]
+    if: >-
+      !cancelled() && needs.check.result == 'success' && needs.feed.result == 'success' &&
+      (needs.rebuild.result == 'success' || needs.rebuild.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: https://dl.gtkhx.org/
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      CHANNELS: ${{ needs.feed.outputs.channels }}
+    steps:
+      # Files only; nothing from this checkout runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mishan/gtkhx
+          ref: main
+          path: gtkhx
+          persist-credentials: false
+          sparse-checkout: |
+            packaging/flatpak
+            src/pixmaps/gtkhx_icon_128.png
+          sparse-checkout-cone-mode: false
+
+      - name: install flatpak and ostree
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak ostree
+
+      - name: mirror the live repository
+        env:
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+        run: |
+          mkdir site
+          ostree --repo=site/repo init --mode=archive
+          status=$(curl -s -o /dev/null -w '%{http_code}' "$SITE/repo/config")
+          if [ "$BOOTSTRAP" = true ]; then
+            if [ "$status" != 404 ]; then
+              echo "::error::$SITE/repo/config answered $status, not 404: the" \
+                   "site may be up, and bootstrapping would replace it" \
+                   "(000 means it couldn't be reached at all)"
+              exit 1
+            fi
+            echo "bootstrapping: starting an empty repository and feed"
+            exit 0
+          fi
+          # A failed pull stops the run: going on would redeploy the site
+          # with only this run's channel in it.
+          ostree --repo=site/repo remote add \
+            --gpg-import=gtkhx/packaging/flatpak/gtkhx.gpg \
+            --set=gpg-verify-summary=true live "$SITE/repo/"
+          ostree --repo=site/repo pull --mirror --depth=2 live
+          ostree --repo=site/repo remote delete live
+          ostree --repo=site/repo refs
+
+      - name: fetch the bundles
+        if: inputs.source == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download "$TAG" -R mishan/gtkhx -p '*.flatpak' -D bundles
+
+      - name: fetch the rebuilt bundles
+        if: inputs.source == 'rebuild'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: gtkhx-flatpak-*
+          path: bundles
+          merge-multiple: true
+
+      - name: import the bundles
+        # Each bundle carries its own ref, which names its architecture, so
+        # the file names don't matter; older releases named theirs
+        # GtkHx-<tag>.flatpak.
+        run: |
+          ostree --repo=scratch init --mode=archive
+          for b in bundles/*.flatpak; do
+            flatpak build-import-bundle --no-update-summary scratch "$b"
+          done
+          ostree --repo=scratch refs | grep "^app/$APP/" | tee scratch-refs
+          # A release missing an architecture (published before its build
+          # finished, say) would leave that architecture's users behind.
+          for arch in x86_64 aarch64; do
+            if ! grep -q "^app/$APP/$arch/" scratch-refs; then
+              echo "::error::no $arch bundle for $TAG; attach it, or use source: rebuild"
+              exit 1
+            fi
+          done
+
+      - name: refuse to move a branch backward
+        # The feed job read updates.json, which Pages may still have served
+        # stale; the mirrored repository is what clients actually have.
+        # Every commit published here is subjected "GtkHx <version>".
+        run: |
+          for ch in $CHANNELS; do
+            while read -r src; do
+              arch=$(printf '%s' "$src" | cut -d/ -f3)
+              ref="app/$APP/$arch/$ch"
+              ostree --repo=site/repo rev-parse "$ref" >/dev/null 2>&1 || continue
+              have=$(ostree --repo=site/repo log "$ref" |
+                     awk '/^    GtkHx / {print $2; exit}')
+              python3 - "$have" "${TAG#v}" "$ref" <<'PY'
+          import re, sys
+          def key(v):
+              m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:b(\d+)|rc(\d+))?", v)
+              if not m:
+                  return None
+              b, rc = m.group(4), m.group(5)
+              stage = (1, int(b)) if b else (2, int(rc)) if rc else (3, 0)
+              return tuple(map(int, m.group(1, 2, 3))) + stage
+          have, new, ref = sys.argv[1:]
+          if not key(have):
+              sys.exit(f"::error::{ref} head has no GtkHx version in its subject")
+          if key(new) and key(new) < key(have):
+              sys.exit(f"::error::{ref} is at {have}; {new} would move it backward."
+                       " If updates.json was stale, run this again.")
+          PY
+            done < scratch-refs
+          done
+
+      - name: sign and commit
+        env:
+          FLATPAK_GPG_KEY: ${{ secrets.FLATPAK_GPG_KEY }}
+          KEY_ID: ${{ secrets.FLATPAK_GPG_KEY_ID }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          install -d -m 700 "$GNUPGHOME"
+          trap 'gpgconf --kill all; rm -rf "$GNUPGHOME"' EXIT
+          printf '%s\n' "$FLATPAK_GPG_KEY" | gpg --batch --quiet --import 2>/dev/null
+          unset FLATPAK_GPG_KEY
+          gpg --batch --list-secret-keys "$KEY_ID" > /dev/null
+
+          sign=(--gpg-sign="$KEY_ID" --gpg-homedir="$GNUPGHOME")
+          while read -r src; do
+            arch=$(printf '%s' "$src" | cut -d/ -f3)
+            for ch in $CHANNELS; do
+              # NOW, not the build's time: a client refuses a commit older
+              # than the one it has, and a ref can move to an older build.
+              flatpak build-commit-from --no-update-summary --timestamp=NOW \
+                --subject="GtkHx ${TAG#v}" "${sign[@]}" \
+                --src-repo=scratch --src-ref="$src" \
+                site/repo "app/$APP/$arch/$ch"
+            done
+          done < scratch-refs
+
+          flatpak build-update-repo --title=GtkHx --default-branch=stable \
+            --generate-static-deltas --prune --prune-depth=2 "${sign[@]}" \
+            site/repo
+
+      - name: check the signatures against the published key
+        run: |
+          ostree --repo=verify init --mode=archive
+          ostree --repo=verify remote add \
+            --gpg-import=gtkhx/packaging/flatpak/gtkhx.gpg \
+            --set=gpg-verify-summary=true check "file://$PWD/site/repo"
+          ostree --repo=verify pull --mirror --commit-metadata-only check
+          rm -rf verify
+
+      - name: write the site
+        env:
+          FEED: ${{ needs.feed.outputs.feed }}
+        run: |
+          printf '%s\n' "$FEED" > site/updates.json
+          key=$(base64 -w0 gtkhx/packaging/flatpak/gtkhx.gpg)
+          cp gtkhx/packaging/flatpak/* site/
+          sed -i "s|@GPGKEY@|$key|" site/*.flatpakrepo site/*.flatpakref
+          cp gtkhx/src/pixmaps/gtkhx_icon_128.png site/gtkhx.png
+
+          # Single-file bundles of the signed commits, which set up the
+          # repository as their remote when installed.
+          for ref in $(ostree --repo=site/repo refs | grep "^app/$APP/"); do
+            arch=$(printf '%s' "$ref" | cut -d/ -f3)
+            branch=$(printf '%s' "$ref" | cut -d/ -f4)
+            case "$branch" in
+              stable) name="GtkHx-$arch.flatpak" ;;
+              *)      name="GtkHx-$branch-$arch.flatpak" ;;
+            esac
+            flatpak build-bundle --arch="$arch" \
+              --repo-url="$SITE/repo/" \
+              --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+              --gpg-keys=gtkhx/packaging/flatpak/gtkhx.gpg \
+              site/repo "site/$name" "$APP" "$branch"
+          done
+          rm -rf site/repo/tmp/*
+          du -sh site site/repo
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+      - name: check the live site
+        # Pages caches for up to ten minutes, so the new summary and feed can
+        # take a while to show. Waiting for them also keeps the next run,
+        # queued behind this one, from reading the site as it was before.
+        run: |
+          want=$(jq -cS . site/updates.json)
+          for _ in $(seq 40); do
+            got=$(curl -fsS "$SITE/updates.json" | jq -cS . || true)
+            [ "$got" = "$want" ] && break
+            sleep 15
+          done
+          if [ "$got" != "$want" ]; then
+            echo "::error::$SITE/updates.json is not the feed just deployed"
+            exit 1
+          fi
+
+          flatpak remote-add --user --from live "$SITE/gtkhx.flatpakrepo"
+          for ch in $CHANNELS; do
+            while read -r src; do
+              arch=$(printf '%s' "$src" | cut -d/ -f3)
+              want=$(ostree --repo=site/repo rev-parse "app/$APP/$arch/$ch")
+              for _ in $(seq 40); do
+                got=$(flatpak remote-info --user --arch="$arch" \
+                        -c live "$APP//$ch" 2>/dev/null || true)
+                [ "$got" = "$want" ] && break
+                sleep 15
+              done
+              if [ "$got" != "$want" ]; then
+                echo "::error::$SITE serves ${got:-nothing} for $arch/$ch, not $want"
+                exit 1
+              fi
+              echo "$arch/$ch: $want"
+            done < scratch-refs
+          done
